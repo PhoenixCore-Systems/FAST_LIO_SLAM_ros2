@@ -7,6 +7,11 @@
 #include <iostream>
 #include <string>
 #include <optional>
+#include <deque>
+#include <filesystem>
+#include <limits>
+#include <algorithm>
+#include <cmath>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -25,14 +30,16 @@
 #include <pcl_conversions/pcl_conversions.h>
 
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/qos.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
-#include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <px4_msgs/msg/sensor_gps.hpp>
+#include <std_srvs/srv/trigger.hpp>
 // #include <tf/transform_datatypes.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/convert.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -55,6 +62,8 @@
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
 #include <gtsam/nonlinear/ISAM2.h>
+
+#include <GeographicLib/LocalCartesian.hpp>
 
 #include "aloam_velodyne/common.h"
 #include "aloam_velodyne/tic_toc.h"
@@ -80,7 +89,6 @@ Pose6D odom_pose_curr {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init pose is zero
 
 std::queue<nav_msgs::msg::Odometry::ConstSharedPtr> odometryBuf;
 std::queue<sensor_msgs::msg::PointCloud2::ConstSharedPtr> fullResBuf;
-std::queue<sensor_msgs::msg::NavSatFix::ConstSharedPtr> gpsBuf;
 std::queue<std::pair<int, int> > scLoopICPBuf;
 
 std::mutex mBuf;
@@ -107,7 +115,6 @@ gtsam::Values isamCurrentEstimate;
 noiseModel::Diagonal::shared_ptr priorNoise;
 noiseModel::Diagonal::shared_ptr odomNoise;
 noiseModel::Base::shared_ptr robustLoopNoise;
-noiseModel::Base::shared_ptr robustGPSNoise;
 
 pcl::VoxelGrid<PointType> downSizeFilterScancontext;
 SCManager scManager;
@@ -122,18 +129,49 @@ pcl::PointCloud<PointType>::Ptr laserCloudMapPGO(new pcl::PointCloud<PointType>(
 pcl::VoxelGrid<PointType> downSizeFilterMapPGO;
 bool laserCloudMapPGORedraw = true;
 
-bool useGPS = true;
-// bool useGPS = false;
-sensor_msgs::msg::NavSatFix::ConstSharedPtr currGPS;
-bool hasGPSforThisKF = false;
-bool gpsOffsetInitialized = false; 
-double gpsAltitudeInitOffset = 0.0;
+struct GpsSample {
+    double stamp = 0.0;
+    double east = 0.0;
+    double north = 0.0;
+    double up = 0.0;
+    double eph = 0.0;
+    double epv = 0.0;
+};
+
+struct GpsAlignmentSample {
+    Pose6D pose;
+    GpsSample gps;
+};
+
+bool useGPS = false;
+bool useScanContextLoopClosure = false;
+bool gpsAnchorInitialized = false;
+bool gpsAlignmentInitialized = false;
+double gpsYawOffset = 0.0;
+double gpsOffsetX = 0.0;
+double gpsOffsetY = 0.0;
+double gpsOffsetZ = 0.0;
+double gpsMinFixType = 3.0;
+double gpsHorizontalSigmaM = 1.0;
+double gpsVerticalSigmaM = 2.0;
+double gpsSigmaInflate = 2.0;
+double gpsHuberThresholdM = 3.0;
+double gpsAnchorWarmupSec = 5.0;
+double gpsMatchWindowSec = 0.05;
+std::string mapFilePath;
+std::string gpsTopic;
+std::string cloudTopic;
+std::string odomTopic;
+std::deque<GpsSample> gpsBuf;
+std::vector<GpsAlignmentSample> gpsAlignmentSamples;
+std::unique_ptr<GeographicLib::LocalCartesian> gpsProjector;
 double recentOptimizedX = 0.0;
 double recentOptimizedY = 0.0;
 
 std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> pubMapAftPGO, pubLoopScanLocal, pubLoopSubmapLocal;
 std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>>  pubOdomAftPGO, pubOdomRepubVerifier;
 std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Path>> pubPathAftPGO;
+std::shared_ptr<rclcpp::Service<std_srvs::srv::Trigger>> mapSaveSrv;
 
 std::string save_directory;
 std::string pgKITTIformat, pgScansDirectory;
@@ -214,14 +252,167 @@ void laserCloudFullResHandler(const sensor_msgs::msg::PointCloud2::ConstSharedPt
 	mBuf.unlock();
 } // laserCloudFullResHandler
 
-void gpsHandler(const sensor_msgs::msg::NavSatFix::ConstSharedPtr _gps)
+bool isValidGpsFix(const px4_msgs::msg::SensorGps::ConstSharedPtr& gps)
 {
-    if(useGPS) {
-        mBuf.lock();
-        gpsBuf.push(_gps);
-        mBuf.unlock();
+    return gps->fix_type >= static_cast<uint8_t>(gpsMinFixType)
+        && std::isfinite(gps->latitude_deg)
+        && std::isfinite(gps->longitude_deg)
+        && std::isfinite(gps->altitude_ellipsoid_m)
+        && std::isfinite(gps->eph)
+        && std::isfinite(gps->epv)
+        && gps->eph > 0.0
+        && gps->epv > 0.0;
+}
+
+std::optional<GpsSample> projectGpsFix(const px4_msgs::msg::SensorGps::ConstSharedPtr& gps, double stamp)
+{
+    if (!isValidGpsFix(gps)) {
+        return std::nullopt;
     }
+
+    if (!gpsAnchorInitialized) {
+        gpsProjector = std::make_unique<GeographicLib::LocalCartesian>(
+            gps->latitude_deg,
+            gps->longitude_deg,
+            gps->altitude_ellipsoid_m);
+        gpsAnchorInitialized = true;
+        RCLCPP_INFO(node->get_logger(),
+            "GPS anchor initialized at lat=%.9f lon=%.9f alt=%.3f",
+            gps->latitude_deg, gps->longitude_deg, gps->altitude_ellipsoid_m);
+    }
+
+    double east = 0.0;
+    double north = 0.0;
+    double up = 0.0;
+    gpsProjector->Forward(
+        gps->latitude_deg,
+        gps->longitude_deg,
+        gps->altitude_ellipsoid_m,
+        east,
+        north,
+        up);
+
+    GpsSample sample;
+    sample.stamp = stamp;
+    sample.east = east;
+    sample.north = north;
+    sample.up = up;
+    sample.eph = gps->eph;
+    sample.epv = gps->epv;
+    return sample;
+}
+
+void gpsHandler(const px4_msgs::msg::SensorGps::ConstSharedPtr _gps)
+{
+    if(!useGPS) {
+        return;
+    }
+
+    const double stamp = node->now().seconds();
+    auto projected = projectGpsFix(_gps, stamp);
+    if(!projected) {
+        return;
+    }
+
+    mBuf.lock();
+    gpsBuf.push_back(*projected);
+    while (gpsBuf.size() > 5000) {
+        gpsBuf.pop_front();
+    }
+    mBuf.unlock();
 } // gpsHandler
+
+std::optional<GpsSample> findNearestGps(double stamp)
+{
+    std::optional<GpsSample> best;
+    double best_dt = std::numeric_limits<double>::max();
+
+    while (!gpsBuf.empty() && gpsBuf.front().stamp < stamp - gpsMatchWindowSec) {
+        gpsBuf.pop_front();
+    }
+
+    for (const auto& sample : gpsBuf) {
+        const double dt = std::abs(sample.stamp - stamp);
+        if (dt < best_dt) {
+            best = sample;
+            best_dt = dt;
+        }
+        if (sample.stamp > stamp + gpsMatchWindowSec) {
+            break;
+        }
+    }
+
+    if (best && best_dt <= gpsMatchWindowSec) {
+        return best;
+    }
+    return std::nullopt;
+}
+
+void rotateGpsToMap(const GpsSample& gps, double& x, double& y, double& z)
+{
+    const double c = std::cos(gpsYawOffset);
+    const double s = std::sin(gpsYawOffset);
+    x = c * gps.east - s * gps.north + gpsOffsetX;
+    y = s * gps.east + c * gps.north + gpsOffsetY;
+    z = gps.up + gpsOffsetZ;
+}
+
+bool updateGpsAlignment(const Pose6D& pose, const GpsSample& gps, double stamp)
+{
+    if (gpsAlignmentInitialized) {
+        return true;
+    }
+
+    gpsAlignmentSamples.push_back({pose, gps});
+    if (gpsAlignmentSamples.empty()) {
+        return false;
+    }
+
+    const auto& first = gpsAlignmentSamples.front();
+    const double elapsed = stamp - first.gps.stamp;
+    const double pose_dx = pose.x - first.pose.x;
+    const double pose_dy = pose.y - first.pose.y;
+    const double gps_dx = gps.east - first.gps.east;
+    const double gps_dy = gps.north - first.gps.north;
+    const double pose_dist = std::hypot(pose_dx, pose_dy);
+    const double gps_dist = std::hypot(gps_dx, gps_dy);
+
+    if (pose_dist >= 1.0 && gps_dist >= 1.0) {
+        const double pose_heading = std::atan2(pose_dy, pose_dx);
+        const double gps_heading = std::atan2(gps_dy, gps_dx);
+        gpsYawOffset = pose_heading - gps_heading;
+    } else if (elapsed < gpsAnchorWarmupSec) {
+        return false;
+    } else {
+        RCLCPP_WARN(node->get_logger(),
+            "GPS warmup had only %.2fm pose motion and %.2fm GPS motion; using zero yaw offset",
+            pose_dist, gps_dist);
+        gpsYawOffset = 0.0;
+    }
+
+    const double c = std::cos(gpsYawOffset);
+    const double s = std::sin(gpsYawOffset);
+    gpsOffsetX = first.pose.x - (c * first.gps.east - s * first.gps.north);
+    gpsOffsetY = first.pose.y - (s * first.gps.east + c * first.gps.north);
+    gpsOffsetZ = first.pose.z - first.gps.up;
+    gpsAlignmentInitialized = true;
+
+    RCLCPP_INFO(node->get_logger(),
+        "GPS-to-map alignment ready: yaw_offset=%.3f rad, offset=(%.3f, %.3f, %.3f)",
+        gpsYawOffset, gpsOffsetX, gpsOffsetY, gpsOffsetZ);
+    return true;
+}
+
+gtsam::noiseModel::Base::shared_ptr gpsNoiseModel(const GpsSample& gps)
+{
+    const double sigma_xy = std::max(gpsHorizontalSigmaM, gps.eph) * gpsSigmaInflate;
+    const double sigma_z = std::max(gpsVerticalSigmaM, gps.epv) * gpsSigmaInflate;
+    gtsam::Vector robustNoiseVector3(3);
+    robustNoiseVector3 << sigma_xy, sigma_xy, sigma_z;
+    return gtsam::noiseModel::Robust::Create(
+        gtsam::noiseModel::mEstimator::Huber::Create(gpsHuberThresholdM),
+        gtsam::noiseModel::Diagonal::Sigmas(robustNoiseVector3));
+}
 
 void initNoises( void )
 {
@@ -240,14 +431,6 @@ void initNoises( void )
     robustLoopNoise = gtsam::noiseModel::Robust::Create(
                     gtsam::noiseModel::mEstimator::Cauchy::Create(1), // optional: replacing Cauchy by DCS or GemanMcClure is okay but Cauchy is empirically good.
                     gtsam::noiseModel::Diagonal::Variances(robustNoiseVector6) );
-
-    double bigNoiseTolerentToXY = 1000000000.0; // 1e9
-    double gpsAltitudeNoiseScore = 250.0; // if height is misaligned after loop clsosing, use this value bigger
-    gtsam::Vector robustNoiseVector3(3); // gps factor has 3 elements (xyz)
-    robustNoiseVector3 << bigNoiseTolerentToXY, bigNoiseTolerentToXY, gpsAltitudeNoiseScore; // means only caring altitude here. (because LOAM-like-methods tends to be asymptotically flyging)
-    robustGPSNoise = gtsam::noiseModel::Robust::Create(
-                    gtsam::noiseModel::mEstimator::Cauchy::Create(1), // optional: replacing Cauchy by DCS or GemanMcClure is okay but Cauchy is empirically good.
-                    gtsam::noiseModel::Diagonal::Variances(robustNoiseVector3) );
 
 } // initNoises
 
@@ -316,7 +499,7 @@ void pubPath( void )
         nav_msgs::msg::Odometry odomAftPGOthis;
         odomAftPGOthis.header.frame_id = "camera_init";
         odomAftPGOthis.child_frame_id = "/aft_pgo";
-        odomAftPGOthis.header.stamp = rclcpp::Time(keyframeTimes.at(node_idx) * 10e9);
+        odomAftPGOthis.header.stamp = rclcpp::Time(static_cast<int64_t>(keyframeTimes.at(node_idx) * 1e9));
         odomAftPGOthis.pose.pose.position.x = pose_est.x;
         odomAftPGOthis.pose.pose.position.y = pose_est.y;
         odomAftPGOthis.pose.pose.position.z = pose_est.z;
@@ -436,7 +619,8 @@ void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes,
             continue;
 
         mKF.lock(); 
-        *nearKeyframes += * local2global(keyframeLaserClouds[keyNear], keyframePosesUpdated[root_idx]);
+        (void)root_idx;
+        *nearKeyframes += * local2global(keyframeLaserClouds[keyNear], keyframePosesUpdated[keyNear]);
         mKF.unlock(); 
     }
 
@@ -506,7 +690,7 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
 
 void process_pg()
 {
-    while(1)
+    while(rclcpp::ok())
     {
 		while ( !odometryBuf.empty() && !fullResBuf.empty() )
         {
@@ -535,19 +719,9 @@ void process_pg()
             Pose6D pose_curr = getOdom(odometryBuf.front());
             odometryBuf.pop();
 
-            // find nearest gps 
-            double eps = 0.1; // find a gps topioc arrived within eps second 
-            while (!gpsBuf.empty()) {
-                auto thisGPS = gpsBuf.front();
-                auto thisGPSTime = toSec(thisGPS->header.stamp);
-                if( abs(thisGPSTime - timeLaserOdometry) < eps ) {
-                    currGPS = thisGPS;
-                    hasGPSforThisKF = true; 
-                    break;
-                } else {
-                    hasGPSforThisKF = false;
-                }
-                gpsBuf.pop();
+            std::optional<GpsSample> gpsForThisKF;
+            if (useGPS) {
+                gpsForThisKF = findNearestGps(timeLaserOdometry);
             }
             mBuf.unlock(); 
 
@@ -572,13 +746,6 @@ void process_pg()
 
             if( ! isNowKeyFrame ) 
                 continue; 
-
-            if( !gpsOffsetInitialized ) {
-                if(hasGPSforThisKF) { // if the very first frame 
-                    gpsAltitudeInitOffset = currGPS->altitude;
-                    gpsOffsetInitialized = true;
-                } 
-            }
 
             //
             // Save data and Add consecutive node 
@@ -627,13 +794,16 @@ void process_pg()
                     gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, poseFrom.between(poseTo), odomNoise));
 
                     // gps factor 
-                    if(hasGPSforThisKF) {
-                        double curr_altitude_offseted = currGPS->altitude - gpsAltitudeInitOffset;
-                        mtxRecentPose.lock();
-                        gtsam::Point3 gpsConstraint(recentOptimizedX, recentOptimizedY, curr_altitude_offseted); // in this example, only adjusting altitude (for x and y, very big noises are set) 
-                        mtxRecentPose.unlock();
-                        gtSAMgraph.add(gtsam::GPSFactor(curr_node_idx, gpsConstraint, robustGPSNoise));
-                        cout << "GPS factor added at node " << curr_node_idx << endl;
+                    if(useGPS && gpsForThisKF) {
+                        if (updateGpsAlignment(pose_curr, *gpsForThisKF, timeLaserOdometry)) {
+                            double gx = 0.0;
+                            double gy = 0.0;
+                            double gz = 0.0;
+                            rotateGpsToMap(*gpsForThisKF, gx, gy, gz);
+                            gtsam::Point3 gpsConstraint(gx, gy, gz);
+                            gtSAMgraph.add(gtsam::GPSFactor(curr_node_idx, gpsConstraint, gpsNoiseModel(*gpsForThisKF)));
+                            cout << "GPS factor added at node " << curr_node_idx << endl;
+                        }
                     }
                     initialEstimate.insert(curr_node_idx, poseTo);                
                     // runISAM2opt();
@@ -663,6 +833,9 @@ void process_pg()
 
 void performSCLoopClosure(void)
 {
+    if (!useScanContextLoopClosure)
+        return;
+
     if( int(keyframePoses.size()) < scManager.NUM_EXCLUDE_RECENT) // do not try too early 
         return;
 
@@ -694,7 +867,7 @@ void process_lcd(void)
 
 void process_icp(void)
 {
-    while(1)
+    while(rclcpp::ok())
     {
 		while ( !scLoopICPBuf.empty() )
         {
@@ -793,11 +966,115 @@ void process_viz_map(void)
     }
 } // pointcloud_viz
 
+pcl::PointCloud<PointType>::Ptr buildOptimizedMap()
+{
+    pcl::PointCloud<PointType>::Ptr map(new pcl::PointCloud<PointType>());
+
+    mKF.lock();
+    const size_t pose_count = std::min(keyframeLaserClouds.size(), keyframePosesUpdated.size());
+    for (size_t node_idx = 0; node_idx < pose_count; ++node_idx) {
+        *map += *local2global(keyframeLaserClouds[node_idx], keyframePosesUpdated[node_idx]);
+    }
+    mKF.unlock();
+
+    if (!map->empty()) {
+        downSizeFilterMapPGO.setInputCloud(map);
+        pcl::PointCloud<PointType>::Ptr filtered(new pcl::PointCloud<PointType>());
+        downSizeFilterMapPGO.filter(*filtered);
+        map = filtered;
+    }
+
+    return map;
+}
+
+void mapSaveCallback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+    if (mapFilePath.empty()) {
+        response->success = false;
+        response->message = "map_file_path is empty";
+        return;
+    }
+
+    if (!gtSAMgraphMade || keyframeLaserClouds.empty()) {
+        response->success = false;
+        response->message = "no pose-graph keyframes available";
+        return;
+    }
+
+    mtxPosegraph.lock();
+    try {
+        if (initialEstimate.size() > 0 || gtSAMgraph.size() > 0) {
+            runISAM2opt();
+        }
+    } catch (const std::exception& exc) {
+        mtxPosegraph.unlock();
+        response->success = false;
+        response->message = std::string("final ISAM2 optimization failed: ") + exc.what();
+        return;
+    }
+    mtxPosegraph.unlock();
+
+    auto map = buildOptimizedMap();
+    if (map->empty()) {
+        response->success = false;
+        response->message = "optimized map is empty";
+        return;
+    }
+
+    try {
+        const auto parent = std::filesystem::path(mapFilePath).parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent);
+        }
+        pcl::PCDWriter pcd_writer;
+        pcd_writer.writeBinary(mapFilePath, *map);
+    } catch (const std::exception& exc) {
+        response->success = false;
+        response->message = std::string("failed to write PCD: ") + exc.what();
+        return;
+    }
+
+    response->success = true;
+    response->message = "optimized map saved";
+    RCLCPP_INFO(node->get_logger(), "Saved optimized PGO map to %s with %zu points",
+        mapFilePath.c_str(), map->size());
+}
+
 
 int main(int argc, char **argv)
 {
   rclcpp::init(argc, argv);
   node = rclcpp::Node::make_shared("laserPGO");
+
+  node->declare_parameter("use_scan_context_loop_closure", false);
+  useScanContextLoopClosure = node->get_parameter("use_scan_context_loop_closure").get_parameter_value().get<bool>();
+  node->declare_parameter("use_gps_factor", false);
+  useGPS = node->get_parameter("use_gps_factor").get_parameter_value().get<bool>();
+  node->declare_parameter("map_file_path", "");
+  mapFilePath = node->get_parameter("map_file_path").get_parameter_value().get<std::string>();
+  node->declare_parameter("cloud_topic", "/velodyne_cloud_registered_local");
+  cloudTopic = node->get_parameter("cloud_topic").get_parameter_value().get<std::string>();
+  node->declare_parameter("odom_topic", "/aft_mapped_to_init");
+  odomTopic = node->get_parameter("odom_topic").get_parameter_value().get<std::string>();
+  node->declare_parameter("gps_topic", "/fmu/out/vehicle_gps_position");
+  gpsTopic = node->get_parameter("gps_topic").get_parameter_value().get<std::string>();
+
+  node->declare_parameter("gps_min_fix_type", 3.0);
+  gpsMinFixType = node->get_parameter("gps_min_fix_type").get_parameter_value().get<double>();
+  node->declare_parameter("gps_horizontal_sigma_m", 1.0);
+  gpsHorizontalSigmaM = node->get_parameter("gps_horizontal_sigma_m").get_parameter_value().get<double>();
+  node->declare_parameter("gps_vertical_sigma_m", 2.0);
+  gpsVerticalSigmaM = node->get_parameter("gps_vertical_sigma_m").get_parameter_value().get<double>();
+  node->declare_parameter("gps_sigma_inflate", 2.0);
+  gpsSigmaInflate = node->get_parameter("gps_sigma_inflate").get_parameter_value().get<double>();
+  node->declare_parameter("gps_huber_threshold_m", 3.0);
+  gpsHuberThresholdM = node->get_parameter("gps_huber_threshold_m").get_parameter_value().get<double>();
+  node->declare_parameter("gps_anchor_warmup_sec", 5.0);
+  gpsAnchorWarmupSec = node->get_parameter("gps_anchor_warmup_sec").get_parameter_value().get<double>();
+  node->declare_parameter("gps_match_window_sec", 0.05);
+  gpsMatchWindowSec = node->get_parameter("gps_match_window_sec").get_parameter_value().get<double>();
 
   node->declare_parameter("save_directory", "/"); // pose assignment every k m move 
   save_directory = node->get_parameter("save_directory").get_parameter_value().get<std::string>();
@@ -806,8 +1083,8 @@ int main(int argc, char **argv)
     pgTimeSaveStream = std::fstream(save_directory + "times.txt", std::fstream::out); 
     pgTimeSaveStream.precision(std::numeric_limits<double>::max_digits10);
     pgScansDirectory = save_directory + "Scans/";
-    auto unused = system((std::string("exec rm -r ") + pgScansDirectory).c_str());
-    unused = system((std::string("mkdir -p ") + pgScansDirectory).c_str());
+    std::filesystem::remove_all(pgScansDirectory);
+    std::filesystem::create_directories(pgScansDirectory);
 
   node->declare_parameter("keyframe_meter_gap", 2.0); // pose assignment every k m move 
   keyframeMeterGap = node->get_parameter("keyframe_meter_gap").get_parameter_value().get<double>();
@@ -816,7 +1093,7 @@ int main(int argc, char **argv)
     keyframeRadGap = deg2rad(keyframeDegGap);
 
   node->declare_parameter("sc_dist_thres", 0.2);
-  scDistThres = node->get_parameter("keyframe_deg_gap").get_parameter_value().get<double>();
+  scDistThres = node->get_parameter("sc_dist_thres").get_parameter_value().get<double>();
   node->declare_parameter("sc_max_radius", 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
   scMaximumRadius = node->get_parameter("sc_max_radius").get_parameter_value().get<double>();
 
@@ -838,9 +1115,10 @@ int main(int argc, char **argv)
   mapVizFilterSize = node->get_parameter("mapviz_filter_size").get_parameter_value().get<double>();
     downSizeFilterMapPGO.setLeafSize(mapVizFilterSize, mapVizFilterSize, mapVizFilterSize);
 
-	auto subLaserCloudFullRes = node->create_subscription<sensor_msgs::msg::PointCloud2>("/velodyne_cloud_registered_local", 100, laserCloudFullResHandler);
-	auto subLaserOdometry = node->create_subscription<nav_msgs::msg::Odometry>("/aft_mapped_to_init", 100, laserOdometryHandler);
-	auto subGPS = node->create_subscription<sensor_msgs::msg::NavSatFix>("/gps/fix", 100, gpsHandler);
+	auto subLaserCloudFullRes = node->create_subscription<sensor_msgs::msg::PointCloud2>(cloudTopic, 100, laserCloudFullResHandler);
+	auto subLaserOdometry = node->create_subscription<nav_msgs::msg::Odometry>(odomTopic, 100, laserOdometryHandler);
+    auto gpsQos = rclcpp::QoS(rclcpp::KeepLast(50)).best_effort();
+	auto subGPS = node->create_subscription<px4_msgs::msg::SensorGps>(gpsTopic, gpsQos, gpsHandler);
 
 	pubOdomAftPGO = node->create_publisher<nav_msgs::msg::Odometry>("/aft_pgo_odom", 100);
 	pubOdomRepubVerifier = node->create_publisher<nav_msgs::msg::Odometry>("/repub_odom", 100);
@@ -849,6 +1127,16 @@ int main(int argc, char **argv)
 
 	pubLoopScanLocal = node->create_publisher<sensor_msgs::msg::PointCloud2>("/loop_scan_local", 100);
 	pubLoopSubmapLocal = node->create_publisher<sensor_msgs::msg::PointCloud2>("/loop_submap_local", 100);
+    mapSaveSrv = node->create_service<std_srvs::srv::Trigger>("/map_save", mapSaveCallback);
+
+    RCLCPP_INFO(node->get_logger(),
+        "laserPGO ready: sc_loop=%s gps_factor=%s cloud=%s odom=%s gps=%s map_file=%s",
+        useScanContextLoopClosure ? "true" : "false",
+        useGPS ? "true" : "false",
+        cloudTopic.c_str(),
+        odomTopic.c_str(),
+        gpsTopic.c_str(),
+        mapFilePath.c_str());
 
 	std::thread posegraph_slam {process_pg}; // pose graph construction
 	std::thread lc_detection {process_lcd}; // loop closure detection 
@@ -859,6 +1147,13 @@ int main(int argc, char **argv)
 	std::thread viz_path {process_viz_path}; // visualization - path (high frequency)
 
  	rclcpp::spin(node);
+
+    if (posegraph_slam.joinable()) posegraph_slam.join();
+    if (lc_detection.joinable()) lc_detection.join();
+    if (icp_calculation.joinable()) icp_calculation.join();
+    if (isam_update.joinable()) isam_update.join();
+    if (viz_map.joinable()) viz_map.join();
+    if (viz_path.joinable()) viz_path.join();
 
 	return 0;
 }
