@@ -521,7 +521,7 @@ void pubPath( void )
 
         nav_msgs::msg::Odometry odomAftPGOthis;
         odomAftPGOthis.header.frame_id = "camera_init";
-        odomAftPGOthis.child_frame_id = "/aft_pgo";
+        odomAftPGOthis.child_frame_id = "aft_pgo";
         odomAftPGOthis.header.stamp = rclcpp::Time(static_cast<int64_t>(keyframeTimes.at(node_idx) * 1e9));
         odomAftPGOthis.pose.pose.position.x = pose_est.x;
         odomAftPGOthis.pose.pose.position.y = pose_est.y;
@@ -550,7 +550,7 @@ void pubPath( void )
     geometry_msgs::msg::TransformStamped transform;
     transform.header.stamp = odomAftPGO.header.stamp;
     transform.header.frame_id = "camera_init";
-    transform.child_frame_id = "/aft_pgo";
+    transform.child_frame_id = "aft_pgo";
     // transform.setOrigin(tf::Vector3(odomAftPGO.pose.pose.position.x, odomAftPGO.pose.pose.position.y, odomAftPGO.pose.pose.position.z));
     transform.transform.translation.x = odomAftPGO.pose.pose.position.x;
     transform.transform.translation.y = odomAftPGO.pose.pose.position.y;
