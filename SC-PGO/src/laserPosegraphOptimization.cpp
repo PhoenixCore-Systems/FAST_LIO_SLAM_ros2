@@ -158,6 +158,8 @@ double gpsSigmaInflate = 2.0;
 double gpsHuberThresholdM = 3.0;
 double gpsAnchorWarmupSec = 5.0;
 double gpsMatchWindowSec = 0.05;
+double gpsAlignmentMinDistanceM = 5.0;
+double gpsMaxResidualM = 20.0;
 std::string mapFilePath;
 std::string gpsTopic;
 std::string cloudTopic;
@@ -377,17 +379,19 @@ bool updateGpsAlignment(const Pose6D& pose, const GpsSample& gps, double stamp)
     const double pose_dist = std::hypot(pose_dx, pose_dy);
     const double gps_dist = std::hypot(gps_dx, gps_dy);
 
-    if (pose_dist >= 1.0 && gps_dist >= 1.0) {
+    if (elapsed < gpsAnchorWarmupSec) {
+        return false;
+    }
+
+    if (pose_dist >= gpsAlignmentMinDistanceM && gps_dist >= gpsAlignmentMinDistanceM) {
         const double pose_heading = std::atan2(pose_dy, pose_dx);
         const double gps_heading = std::atan2(gps_dy, gps_dx);
         gpsYawOffset = pose_heading - gps_heading;
-    } else if (elapsed < gpsAnchorWarmupSec) {
-        return false;
     } else {
         RCLCPP_WARN(node->get_logger(),
-            "GPS warmup had only %.2fm pose motion and %.2fm GPS motion; using zero yaw offset",
-            pose_dist, gps_dist);
-        gpsYawOffset = 0.0;
+            "GPS alignment waiting for more motion: pose_dist=%.2fm gps_dist=%.2fm need>=%.2fm",
+            pose_dist, gps_dist, gpsAlignmentMinDistanceM);
+        return false;
     }
 
     const double c = std::cos(gpsYawOffset);
@@ -400,6 +404,25 @@ bool updateGpsAlignment(const Pose6D& pose, const GpsSample& gps, double stamp)
     RCLCPP_INFO(node->get_logger(),
         "GPS-to-map alignment ready: yaw_offset=%.3f rad, offset=(%.3f, %.3f, %.3f)",
         gpsYawOffset, gpsOffsetX, gpsOffsetY, gpsOffsetZ);
+    return true;
+}
+
+bool gpsConstraintWithinResidualGate(const Pose6D& pose, const GpsSample& gps, double& x, double& y, double& z)
+{
+    rotateGpsToMap(gps, x, y, z);
+
+    if (gpsMaxResidualM <= 0.0) {
+        return true;
+    }
+
+    const double residual_xy = std::hypot(x - pose.x, y - pose.y);
+    if (residual_xy > gpsMaxResidualM) {
+        RCLCPP_WARN(node->get_logger(),
+            "Rejecting GPS factor: residual %.2fm exceeds gate %.2fm",
+            residual_xy, gpsMaxResidualM);
+        return false;
+    }
+
     return true;
 }
 
@@ -799,10 +822,11 @@ void process_pg()
                             double gx = 0.0;
                             double gy = 0.0;
                             double gz = 0.0;
-                            rotateGpsToMap(*gpsForThisKF, gx, gy, gz);
-                            gtsam::Point3 gpsConstraint(gx, gy, gz);
-                            gtSAMgraph.add(gtsam::GPSFactor(curr_node_idx, gpsConstraint, gpsNoiseModel(*gpsForThisKF)));
-                            cout << "GPS factor added at node " << curr_node_idx << endl;
+                            if (gpsConstraintWithinResidualGate(pose_curr, *gpsForThisKF, gx, gy, gz)) {
+                                gtsam::Point3 gpsConstraint(gx, gy, gz);
+                                gtSAMgraph.add(gtsam::GPSFactor(curr_node_idx, gpsConstraint, gpsNoiseModel(*gpsForThisKF)));
+                                cout << "GPS factor added at node " << curr_node_idx << endl;
+                            }
                         }
                     }
                     initialEstimate.insert(curr_node_idx, poseTo);                
@@ -1075,6 +1099,10 @@ int main(int argc, char **argv)
   gpsAnchorWarmupSec = node->get_parameter("gps_anchor_warmup_sec").get_parameter_value().get<double>();
   node->declare_parameter("gps_match_window_sec", 0.05);
   gpsMatchWindowSec = node->get_parameter("gps_match_window_sec").get_parameter_value().get<double>();
+  node->declare_parameter("gps_alignment_min_distance_m", 5.0);
+  gpsAlignmentMinDistanceM = node->get_parameter("gps_alignment_min_distance_m").get_parameter_value().get<double>();
+  node->declare_parameter("gps_max_residual_m", 20.0);
+  gpsMaxResidualM = node->get_parameter("gps_max_residual_m").get_parameter_value().get<double>();
 
   node->declare_parameter("save_directory", "/"); // pose assignment every k m move 
   save_directory = node->get_parameter("save_directory").get_parameter_value().get<std::string>();
