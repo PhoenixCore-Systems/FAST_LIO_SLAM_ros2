@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.3)
+cmake_minimum_required(VERSION 3.5)
 project(fast_lio)
 
 SET(CMAKE_BUILD_TYPE "Debug")
@@ -42,19 +42,18 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   ${OpenMP_C_FLAGS}")
 find_package(PythonLibs REQUIRED)
 find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")
 
-find_package(catkin REQUIRED COMPONENTS
-  geometry_msgs
-  nav_msgs
-  sensor_msgs
-  roscpp
-  rospy
-  std_msgs
-  pcl_ros
-  tf
-  livox_ros_driver
-  message_generation
-  eigen_conversions
-)
+find_package(ament_cmake REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(rclpy REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(pcl_ros REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(livox_ros2_driver REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+# find_package(eigen_conversions REQUIRED)
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL 1.8 REQUIRED)
@@ -62,28 +61,36 @@ find_package(PCL 1.8 REQUIRED)
 message(Eigen: ${EIGEN3_INCLUDE_DIR})
 
 include_directories(
-	${catkin_INCLUDE_DIRS} 
   ${EIGEN3_INCLUDE_DIR}
   ${PCL_INCLUDE_DIRS}
   ${PYTHON_INCLUDE_DIRS}
   include)
 
-add_message_files(
-  FILES
-  Pose6D.msg
+# add_message_files(
+#   FILES
+#   Pose6D.msg
+# )
+
+set(msg_files
+  msg/Pose6D.msg)
+rosidl_generate_interfaces(
+  ${PROJECT_NAME}
+  ${msg_files}
+  DEPENDENCIES
+  geometry_msgs
 )
 
-generate_messages(
- DEPENDENCIES
- geometry_msgs
-)
+ament_package()
 
-catkin_package(
-  CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs message_runtime
-  DEPENDS EIGEN3 PCL
-  INCLUDE_DIRS
-)
+# catkin_package(
+#   CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs message_runtime
+#   DEPENDS EIGEN3 PCL
+#   INCLUDE_DIRS
+# )
 
 add_executable(fastlio_mapping src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp)
-target_link_libraries(fastlio_mapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES})
+rosidl_target_interfaces(fastlio_mapping ${PROJECT_NAME} "rosidl_typesupport_cpp")
+add_dependencies(fastlio_mapping ${PROJECT_NAME})
+ament_target_dependencies(fastlio_mapping rclcpp rclpy std_msgs geometry_msgs nav_msgs sensor_msgs livox_ros2_driver tf2 tf2_ros)
+target_link_libraries(fastlio_mapping ${PCL_LIBRARIES} ${PYTHON_LIBRARIES})
 target_include_directories(fastlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})

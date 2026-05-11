@@ -34,22 +34,23 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <memory>
 #include <math.h>
 #include <vector>
 #include <aloam_velodyne/common.h>
-#include <nav_msgs/Odometry.h>
-#include <nav_msgs/Path.h>
-#include <geometry_msgs/PoseStamped.h>
+#include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/kdtree/kdtree_flann.h>
-#include <ros/ros.h>
-#include <sensor_msgs/Imu.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <tf/transform_datatypes.h>
-#include <tf/transform_broadcaster.h>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+// #include <tf2_ros/transform_datatypes.h>
+#include <tf2_ros/transform_broadcaster.h>
 #include <eigen3/Eigen/Dense>
 #include <ceres/ceres.h>
 #include <mutex>
@@ -61,6 +62,9 @@
 #include "lidarFactor.hpp"
 #include "aloam_velodyne/common.h"
 #include "aloam_velodyne/tic_toc.h"
+
+
+std::shared_ptr<rclcpp::Node> node;
 
 
 int frameCount = 0;
@@ -120,10 +124,10 @@ Eigen::Quaterniond q_wodom_curr(1, 0, 0, 0);
 Eigen::Vector3d t_wodom_curr(0, 0, 0);
 
 
-std::queue<sensor_msgs::PointCloud2ConstPtr> cornerLastBuf;
-std::queue<sensor_msgs::PointCloud2ConstPtr> surfLastBuf;
-std::queue<sensor_msgs::PointCloud2ConstPtr> fullResBuf;
-std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
+std::queue<sensor_msgs::msg::PointCloud2::ConstSharedPtr> cornerLastBuf;
+std::queue<sensor_msgs::msg::PointCloud2::ConstSharedPtr> surfLastBuf;
+std::queue<sensor_msgs::msg::PointCloud2::ConstSharedPtr> fullResBuf;
+std::queue<nav_msgs::msg::Odometry::ConstSharedPtr> odometryBuf;
 std::mutex mBuf;
 
 pcl::VoxelGrid<PointType> downSizeFilterCorner;
@@ -134,10 +138,11 @@ std::vector<float> pointSearchSqDis;
 
 PointType pointOri, pointSel;
 
-ros::Publisher pubLaserCloudSurround, pubLaserCloudMap, pubLaserCloudFullRes, pubOdomAftMapped, pubOdomAftMappedHighFrec, pubLaserAfterMappedPath;
-ros::Publisher pubLaserCloudFullResLocal;
+std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> pubLaserCloudSurround, pubLaserCloudMap, pubLaserCloudFullRes, pubLaserCloudFullResLocal;
+std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> pubOdomAftMapped, pubOdomAftMappedHighFrec;
+std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Path>> pubLaserAfterMappedPath;
 
-nav_msgs::Path laserAfterMappedPath;
+nav_msgs::msg::Path laserAfterMappedPath;
 
 // set initial guess
 void transformAssociateToMap()
@@ -173,21 +178,21 @@ void pointAssociateTobeMapped(PointType const *const pi, PointType *const po)
 	po->intensity = pi->intensity;
 }
 
-void laserCloudCornerLastHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloudCornerLast2)
+void laserCloudCornerLastHandler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr laserCloudCornerLast2)
 {
 	mBuf.lock();
 	cornerLastBuf.push(laserCloudCornerLast2);
 	mBuf.unlock();
 }
 
-void laserCloudSurfLastHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloudSurfLast2)
+void laserCloudSurfLastHandler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr laserCloudSurfLast2)
 {
 	mBuf.lock();
 	surfLastBuf.push(laserCloudSurfLast2);
 	mBuf.unlock();
 }
 
-void laserCloudFullResHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloudFullRes2)
+void laserCloudFullResHandler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr laserCloudFullRes2)
 {
 	mBuf.lock();
 	fullResBuf.push(laserCloudFullRes2);
@@ -195,7 +200,7 @@ void laserCloudFullResHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloud
 }
 
 //receive odomtry
-void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr &laserOdometry)
+void laserOdometryHandler(const nav_msgs::msg::Odometry::ConstSharedPtr laserOdometry)
 {
 	mBuf.lock();
 	odometryBuf.push(laserOdometry);
@@ -215,7 +220,7 @@ void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr &laserOdometry)
 	Eigen::Quaterniond q_w_curr = q_wmap_wodom * q_wodom_curr;
 	Eigen::Vector3d t_w_curr = q_wmap_wodom * t_wodom_curr + t_wmap_wodom; 
 
-	nav_msgs::Odometry odomAftMapped;
+  nav_msgs::msg::Odometry odomAftMapped;
 	odomAftMapped.header.frame_id = "camera_init";
 	odomAftMapped.child_frame_id = "/aft_mapped";
 	odomAftMapped.header.stamp = laserOdometry->header.stamp;
@@ -226,7 +231,13 @@ void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr &laserOdometry)
 	odomAftMapped.pose.pose.position.x = t_w_curr.x();
 	odomAftMapped.pose.pose.position.y = t_w_curr.y();
 	odomAftMapped.pose.pose.position.z = t_w_curr.z();
-	pubOdomAftMappedHighFrec.publish(odomAftMapped);
+	pubOdomAftMappedHighFrec->publish(odomAftMapped);
+}
+
+double toSec(const builtin_interfaces::msg::Time& stamp) {
+  const double sec = (double) stamp.sec;
+  const double nsec = (double) stamp.nanosec;
+  return (double)sec + 1e-9*(double)nsec;
 }
 
 void process()
@@ -237,7 +248,7 @@ void process()
 			!fullResBuf.empty() && !odometryBuf.empty())
 		{
 			mBuf.lock();
-			while (!odometryBuf.empty() && odometryBuf.front()->header.stamp.toSec() < cornerLastBuf.front()->header.stamp.toSec())
+			while (!odometryBuf.empty() && toSec(odometryBuf.front()->header.stamp) < toSec(cornerLastBuf.front()->header.stamp))
 				odometryBuf.pop();
 			if (odometryBuf.empty())
 			{
@@ -245,7 +256,7 @@ void process()
 				break;
 			}
 
-			while (!surfLastBuf.empty() && surfLastBuf.front()->header.stamp.toSec() < cornerLastBuf.front()->header.stamp.toSec())
+			while (!surfLastBuf.empty() && toSec(surfLastBuf.front()->header.stamp) < toSec(cornerLastBuf.front()->header.stamp))
 				surfLastBuf.pop();
 			if (surfLastBuf.empty())
 			{
@@ -253,7 +264,7 @@ void process()
 				break;
 			}
 
-			while (!fullResBuf.empty() && fullResBuf.front()->header.stamp.toSec() < cornerLastBuf.front()->header.stamp.toSec())
+			while (!fullResBuf.empty() && toSec(fullResBuf.front()->header.stamp) < toSec(cornerLastBuf.front()->header.stamp))
 				fullResBuf.pop();
 			if (fullResBuf.empty())
 			{
@@ -261,10 +272,10 @@ void process()
 				break;
 			}
 
-			timeLaserCloudCornerLast = cornerLastBuf.front()->header.stamp.toSec();
-			timeLaserCloudSurfLast = surfLastBuf.front()->header.stamp.toSec();
-			timeLaserCloudFullRes = fullResBuf.front()->header.stamp.toSec();
-			timeLaserOdometry = odometryBuf.front()->header.stamp.toSec();
+			timeLaserCloudCornerLast = toSec(cornerLastBuf.front()->header.stamp);
+			timeLaserCloudSurfLast = toSec(surfLastBuf.front()->header.stamp);
+			timeLaserCloudFullRes = toSec(fullResBuf.front()->header.stamp);
+			timeLaserOdometry = toSec(odometryBuf.front()->header.stamp);
 
 			if (timeLaserCloudCornerLast != timeLaserOdometry ||
 				timeLaserCloudSurfLast != timeLaserOdometry ||
@@ -730,7 +741,7 @@ void process()
 			}
 			else
 			{
-				ROS_WARN("time Map corner and surf num are not enough");
+				RCLCPP_WARN(node->get_logger(), "time Map corner and surf num are not enough");
 			}
 			transformUpdate();
 
@@ -814,11 +825,11 @@ void process()
 					*laserCloudSurround += *laserCloudSurfArray[ind];
 				}
 
-				sensor_msgs::PointCloud2 laserCloudSurround3;
+        sensor_msgs::msg::PointCloud2 laserCloudSurround3;
 				pcl::toROSMsg(*laserCloudSurround, laserCloudSurround3);
-				laserCloudSurround3.header.stamp = ros::Time().fromSec(timeLaserOdometry);
+				laserCloudSurround3.header.stamp = rclcpp::Time(timeLaserOdometry * 10e9);
 				laserCloudSurround3.header.frame_id = "camera_init";
-				pubLaserCloudSurround.publish(laserCloudSurround3);
+				pubLaserCloudSurround->publish(laserCloudSurround3);
 			}
 
 			if (frameCount % 20 == 0)
@@ -829,18 +840,18 @@ void process()
 					laserCloudMap += *laserCloudCornerArray[i];
 					laserCloudMap += *laserCloudSurfArray[i];
 				}
-				sensor_msgs::PointCloud2 laserCloudMsg;
+        sensor_msgs::msg::PointCloud2 laserCloudMsg;
 				pcl::toROSMsg(laserCloudMap, laserCloudMsg);
-				laserCloudMsg.header.stamp = ros::Time().fromSec(timeLaserOdometry);
+				laserCloudMsg.header.stamp = rclcpp::Time(timeLaserOdometry * 10e9);
 				laserCloudMsg.header.frame_id = "camera_init";
-				pubLaserCloudMap.publish(laserCloudMsg);
+				pubLaserCloudMap->publish(laserCloudMsg);
 			}
 
-			sensor_msgs::PointCloud2 laserCloudFullRes3Local;
+      sensor_msgs::msg::PointCloud2 laserCloudFullRes3Local;
 			pcl::toROSMsg(*laserCloudFullRes, laserCloudFullRes3Local);
-			laserCloudFullRes3Local.header.stamp = ros::Time().fromSec(timeLaserOdometry);
+			laserCloudFullRes3Local.header.stamp = rclcpp::Time(timeLaserOdometry * 10e9);
 			laserCloudFullRes3Local.header.frame_id = "camera_init";
-			pubLaserCloudFullResLocal.publish(laserCloudFullRes3Local);
+			pubLaserCloudFullResLocal->publish(laserCloudFullRes3Local);
 
 			int laserCloudFullResNum = laserCloudFullRes->points.size();
 			for (int i = 0; i < laserCloudFullResNum; i++)
@@ -848,20 +859,20 @@ void process()
 				pointAssociateToMap(&laserCloudFullRes->points[i], &laserCloudFullRes->points[i]);
 			}
 
-			sensor_msgs::PointCloud2 laserCloudFullRes3;
+      sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
 			pcl::toROSMsg(*laserCloudFullRes, laserCloudFullRes3);
-			laserCloudFullRes3.header.stamp = ros::Time().fromSec(timeLaserOdometry);
+			laserCloudFullRes3.header.stamp = rclcpp::Time(timeLaserOdometry * 10e9);
 			laserCloudFullRes3.header.frame_id = "camera_init";
-			pubLaserCloudFullRes.publish(laserCloudFullRes3);
+			pubLaserCloudFullRes->publish(laserCloudFullRes3);
 
 			//printf("mapping pub time %f ms \n", t_pub.toc());
 
 			//printf("whole mapping time %f ms ++++++++++\n", t_whole.toc());
 
-			nav_msgs::Odometry odomAftMapped;
+      nav_msgs::msg::Odometry odomAftMapped;
 			odomAftMapped.header.frame_id = "camera_init";
 			odomAftMapped.child_frame_id = "/aft_mapped";
-			odomAftMapped.header.stamp = ros::Time().fromSec(timeLaserOdometry);
+			odomAftMapped.header.stamp = rclcpp::Time(timeLaserOdometry * 10e9);
 			odomAftMapped.pose.pose.orientation.x = q_w_curr.x();
 			odomAftMapped.pose.pose.orientation.y = q_w_curr.y();
 			odomAftMapped.pose.pose.orientation.z = q_w_curr.z();
@@ -869,34 +880,46 @@ void process()
 			odomAftMapped.pose.pose.position.x = t_w_curr.x();
 			odomAftMapped.pose.pose.position.y = t_w_curr.y();
 			odomAftMapped.pose.pose.position.z = t_w_curr.z();
-			pubOdomAftMapped.publish(odomAftMapped);
+			pubOdomAftMapped->publish(odomAftMapped);
 
 			// double roll, pitch, yaw;
 			// geometry_msgs::Quaternion quat = odomAftMapped.pose.pose.orientation;
 			// tf::Matrix3x3(tf::Quaternion(quat.x, quat.y, quat.z, quat.w)).getRPY(roll, pitch, yaw);
 			// std::cout << "pub - roll, pitch, yaw (deg): " << rad2deg(roll) << ", " << rad2deg(pitch) << ", " << rad2deg(yaw) << std::endl;
 
-			geometry_msgs::PoseStamped laserAfterMappedPose;
+      geometry_msgs::msg::PoseStamped laserAfterMappedPose;
 			laserAfterMappedPose.header = odomAftMapped.header;
 			laserAfterMappedPose.pose = odomAftMapped.pose.pose;
 
 			laserAfterMappedPath.header.stamp = odomAftMapped.header.stamp;
 			laserAfterMappedPath.header.frame_id = "camera_init";
 			laserAfterMappedPath.poses.push_back(laserAfterMappedPose);
-			pubLaserAfterMappedPath.publish(laserAfterMappedPath);
+			pubLaserAfterMappedPath->publish(laserAfterMappedPath);
 
-			static tf::TransformBroadcaster br;
-			tf::Transform transform;
-			tf::Quaternion q;
-			transform.setOrigin(tf::Vector3(t_w_curr(0),
-											t_w_curr(1),
-											t_w_curr(2)));
-			q.setW(q_w_curr.w());
-			q.setX(q_w_curr.x());
-			q.setY(q_w_curr.y());
-			q.setZ(q_w_curr.z());
-			transform.setRotation(q);
-			br.sendTransform(tf::StampedTransform(transform, odomAftMapped.header.stamp, "camera_init", "/aft_mapped"));
+			static std::unique_ptr<tf2_ros::TransformBroadcaster> br = std::make_unique<tf2_ros::TransformBroadcaster>(node);
+			// tf::Transform transform;
+      geometry_msgs::msg::TransformStamped transform;
+      transform.header.stamp = odomAftMapped.header.stamp;
+      transform.header.frame_id = "camera_init";
+      transform.child_frame_id = "/aft_mapped";
+
+			// transform.setOrigin(tf::Vector3(t_w_curr(0),
+			// 								t_w_curr(1),
+			// 								t_w_curr(2)));
+      transform.transform.translation.x = t_w_curr(0);
+      transform.transform.translation.y = t_w_curr(1);
+      transform.transform.translation.z = t_w_curr(2);
+			// tf::Quaternion q;
+			// q.setW(q_w_curr.w());
+			// q.setX(q_w_curr.x());
+			// q.setY(q_w_curr.y());
+			// q.setZ(q_w_curr.z());
+			// transform.setRotation(q);
+      transform.transform.rotation.x = q_w_curr.x();
+      transform.transform.rotation.y = q_w_curr.y();
+      transform.transform.rotation.z = q_w_curr.z();
+      transform.transform.rotation.w = q_w_curr.w();
+			br->sendTransform(transform);
 
 			frameCount++;
 		}
@@ -907,37 +930,40 @@ void process()
 
 int main(int argc, char **argv)
 {
-	ros::init(argc, argv, "laserMapping");
-	ros::NodeHandle nh;
+  
+  rclcpp::init(argc, argv);
+  node = rclcpp::Node::make_shared("laserMapping");
 
 	float lineRes = 0;
 	float planeRes = 0;
-	nh.param<float>("mapping_line_resolution", lineRes, 0.4);
-	nh.param<float>("mapping_plane_resolution", planeRes, 0.8);
+	node->declare_parameter("mapping_line_resolution", 0.4);
+  lineRes = node->get_parameter("mapping_line_resolution").get_parameter_value().get<float>();
+	node->declare_parameter("mapping_plane_resolution", 0.8);
+  planeRes = node->get_parameter("mapping_plane_resolution").get_parameter_value().get<float>();
 	//printf("line resolution %f plane resolution %f \n", lineRes, planeRes);
 	downSizeFilterCorner.setLeafSize(lineRes, lineRes,lineRes);
 	downSizeFilterSurf.setLeafSize(planeRes, planeRes, planeRes);
 
-	ros::Subscriber subLaserCloudCornerLast = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_corner_last", 100, laserCloudCornerLastHandler);
+	auto subLaserCloudCornerLast = node->create_subscription<sensor_msgs::msg::PointCloud2>("/laser_cloud_corner_last", 100, laserCloudCornerLastHandler);
 
-	ros::Subscriber subLaserCloudSurfLast = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_surf_last", 100, laserCloudSurfLastHandler);
+	auto subLaserCloudSurfLast = node->create_subscription<sensor_msgs::msg::PointCloud2>("/laser_cloud_surf_last", 100, laserCloudSurfLastHandler);
 
-	ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/laser_odom_to_init", 100, laserOdometryHandler);
+	auto subLaserOdometry = node->create_subscription<nav_msgs::msg::Odometry>("/laser_odom_to_init", 100, laserOdometryHandler);
 
-	ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_3", 100, laserCloudFullResHandler);
+	auto subLaserCloudFullRes = node->create_subscription<sensor_msgs::msg::PointCloud2>("/velodyne_cloud_3", 100, laserCloudFullResHandler);
 
-	pubLaserCloudSurround = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_surround", 100);
+	pubLaserCloudSurround = node->create_publisher<sensor_msgs::msg::PointCloud2>("/laser_cloud_surround", 100);
 
-	pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_map", 100);
+	pubLaserCloudMap = node->create_publisher<sensor_msgs::msg::PointCloud2>("/laser_cloud_map", 100);
 
-	pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/velodyne_cloud_registered", 100);
-	pubLaserCloudFullResLocal = nh.advertise<sensor_msgs::PointCloud2>("/velodyne_cloud_registered_local", 100);
+	pubLaserCloudFullRes = node->create_publisher<sensor_msgs::msg::PointCloud2>("/velodyne_cloud_registered", 100);
+	pubLaserCloudFullResLocal = node->create_publisher<sensor_msgs::msg::PointCloud2>("/velodyne_cloud_registered_local", 100);
 
-	pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_init", 100);
+	pubOdomAftMapped = node->create_publisher<nav_msgs::msg::Odometry>("/aft_mapped_to_init", 100);
 
-	pubOdomAftMappedHighFrec = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_init_high_frec", 100);
+	pubOdomAftMappedHighFrec = node->create_publisher<nav_msgs::msg::Odometry>("/aft_mapped_to_init_high_frec", 100);
 
-	pubLaserAfterMappedPath = nh.advertise<nav_msgs::Path>("/aft_mapped_path", 100);
+	pubLaserAfterMappedPath = node->create_publisher<nav_msgs::msg::Path>("/aft_mapped_path", 100);
 
 	for (int i = 0; i < laserCloudNum; i++)
 	{
@@ -947,7 +973,7 @@ int main(int argc, char **argv)
 
 	std::thread mapping_process{process};
 
-	ros::spin();
+	rclcpp::spin_some(node);
 
 	return 0;
 }

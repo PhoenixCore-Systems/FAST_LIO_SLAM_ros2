@@ -9,18 +9,18 @@
 #include <opencv2/opencv.hpp>
 #include <image_transport/image_transport.h>
 #include <opencv2/highgui/highgui.hpp>
-#include <nav_msgs/Odometry.h>
-#include <nav_msgs/Path.h>
-#include <ros/ros.h>
-#include <rosbag/bag.h>
-#include <geometry_msgs/PoseStamped.h>
+#include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <rosbag2_cpp/writer.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <cv_bridge/cv_bridge.h>
-#include <sensor_msgs/image_encodings.h>
+#include <sensor_msgs/image_encodings.hpp>
 #include <eigen3/Eigen/Dense>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
-#include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/msg/point_cloud2.hpp>
 
 std::vector<float> read_lidar_data(const std::string lidar_data_path)
 {
