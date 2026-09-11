@@ -10,6 +10,7 @@
 #include <deque>
 #include <filesystem>
 #include <limits>
+#include <set>
 #include <algorithm>
 #include <cmath>
 
@@ -91,6 +92,14 @@ std::queue<nav_msgs::msg::Odometry::ConstSharedPtr> odometryBuf;
 std::queue<sensor_msgs::msg::PointCloud2::ConstSharedPtr> fullResBuf;
 std::queue<std::pair<int, int> > scLoopICPBuf;
 
+// ScanContext runs faster than keyframe creation, so it can report the same
+// pair repeatedly.  Without admission state every report becomes another
+// identical GTSAM factor and silently over-weights that closure.
+std::set<std::pair<int, int>> attemptedScLoopPairs;
+std::set<std::pair<int, int>> acceptedScLoopPairs;
+std::set<int> acceptedScLoopCurrentFrames;
+std::mutex mtxLoopState;
+
 std::mutex mBuf;
 std::mutex mKF;
 
@@ -119,6 +128,9 @@ noiseModel::Base::shared_ptr robustLoopNoise;
 pcl::VoxelGrid<PointType> downSizeFilterScancontext;
 SCManager scManager;
 double scDistThres, scMaximumRadius;
+double loopIcpFitnessThreshold = 0.15;
+double loopMaxCorrectionTranslationM = 2.0;
+double loopMaxCorrectionRotationDeg = 30.0;
 
 pcl::VoxelGrid<PointType> downSizeFilterICP;
 std::mutex mtxICP;
@@ -692,12 +704,15 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
     icp.align(*unused_result);
  
-    float loopFitnessScoreThreshold = 0.3; // user parameter but fixed low value is safe. 
-    if (icp.hasConverged() == false || icp.getFitnessScore() > loopFitnessScoreThreshold) {
-        std::cout << "[SC loop] ICP fitness test failed (" << icp.getFitnessScore() << " > " << loopFitnessScoreThreshold << "). Reject this SC loop." << std::endl;
+    const double fitness = icp.getFitnessScore();
+    if (!icp.hasConverged() || !std::isfinite(fitness) ||
+        fitness > loopIcpFitnessThreshold) {
+        std::cout << "[SC loop] ICP fitness test failed (" << fitness << " > "
+                  << loopIcpFitnessThreshold << "). Reject this SC loop." << std::endl;
         return std::nullopt;
     } else {
-        std::cout << "[SC loop] ICP fitness test passed (" << icp.getFitnessScore() << " < " << loopFitnessScoreThreshold << "). Add this SC loop." << std::endl;
+        std::cout << "[SC loop] ICP fitness test passed (" << fitness << " <= "
+                  << loopIcpFitnessThreshold << ")." << std::endl;
     }
 
     // Get pose transformation
@@ -705,6 +720,21 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     Eigen::Affine3f correctionLidarFrame;
     correctionLidarFrame = icp.getFinalTransformation();
     pcl::getTranslationAndEulerAngles (correctionLidarFrame, x, y, z, roll, pitch, yaw);
+    const double correction_translation = std::sqrt(x * x + y * y + z * z);
+    const double correction_rotation_deg =
+        180.0 / M_PI * std::sqrt(roll * roll + pitch * pitch + yaw * yaw);
+    const bool translation_rejected = loopMaxCorrectionTranslationM > 0.0 &&
+        correction_translation > loopMaxCorrectionTranslationM;
+    const bool rotation_rejected = loopMaxCorrectionRotationDeg > 0.0 &&
+        correction_rotation_deg > loopMaxCorrectionRotationDeg;
+    if (!std::isfinite(correction_translation) ||
+        !std::isfinite(correction_rotation_deg) || translation_rejected || rotation_rejected) {
+        RCLCPP_WARN(node->get_logger(),
+            "Rejecting SC loop %d<->%d: ICP correction %.3fm / %.2fdeg exceeds gates %.3fm / %.2fdeg",
+            _loop_kf_idx, _curr_kf_idx, correction_translation, correction_rotation_deg,
+            loopMaxCorrectionTranslationM, loopMaxCorrectionRotationDeg);
+        return std::nullopt;
+    }
     gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
     gtsam::Pose3 poseTo = Pose3(Rot3::RzRyRx(0.0, 0.0, 0.0), Point3(0.0, 0.0, 0.0));
 
@@ -868,10 +898,26 @@ void performSCLoopClosure(void)
     if( SCclosestHistoryFrameID != -1 ) { 
         const int prev_node_idx = SCclosestHistoryFrameID;
         const int curr_node_idx = keyframePoses.size() - 1; // because cpp starts 0 and ends n-1
-        cout << "Loop detected! - between " << prev_node_idx << " and " << curr_node_idx << "" << endl;
+        const std::pair<int, int> loop_pair(prev_node_idx, curr_node_idx);
+
+        {
+            std::lock_guard<std::mutex> lock(mtxLoopState);
+            if (acceptedScLoopCurrentFrames.count(curr_node_idx) != 0U) {
+                return;
+            }
+            // Cache attempts, not just accepted pairs.  Retrying the same
+            // geometry once per second cannot add evidence; it only consumes
+            // CPU and, before this guard, inserted duplicate graph factors.
+            if (!attemptedScLoopPairs.insert(loop_pair).second) {
+                return;
+            }
+        }
+
+        cout << "Loop candidate queued - between " << prev_node_idx << " and "
+             << curr_node_idx << endl;
 
         mBuf.lock();
-        scLoopICPBuf.push(std::pair<int, int>(prev_node_idx, curr_node_idx));
+        scLoopICPBuf.push(loop_pair);
         // addding actual 6D constraints in the other thread, icp_calculation.
         mBuf.unlock();
     }
@@ -906,13 +952,35 @@ void process_icp(void)
 
             const int prev_node_idx = loop_idx_pair.first;
             const int curr_node_idx = loop_idx_pair.second;
+            {
+                std::lock_guard<std::mutex> lock(mtxLoopState);
+                if (acceptedScLoopCurrentFrames.count(curr_node_idx) != 0U ||
+                    acceptedScLoopPairs.count(loop_idx_pair) != 0U) {
+                    continue;
+                }
+            }
             auto relative_pose_optional = doICPVirtualRelative(prev_node_idx, curr_node_idx);
             if(relative_pose_optional) {
                 gtsam::Pose3 relative_pose = relative_pose_optional.value();
+
+                // Detection and ICP are asynchronous.  Re-check admission
+                // after ICP so two queued candidates for one current keyframe
+                // cannot both reach the graph.
+                {
+                    std::lock_guard<std::mutex> lock(mtxLoopState);
+                    if (acceptedScLoopCurrentFrames.count(curr_node_idx) != 0U ||
+                        !acceptedScLoopPairs.insert(loop_idx_pair).second) {
+                        continue;
+                    }
+                    acceptedScLoopCurrentFrames.insert(curr_node_idx);
+                }
                 mtxPosegraph.lock();
                 gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, relative_pose, robustLoopNoise));
                 // runISAM2opt();
                 mtxPosegraph.unlock();
+                RCLCPP_INFO(node->get_logger(),
+                    "Accepted one SC loop factor for current keyframe %d: history=%d",
+                    curr_node_idx, prev_node_idx);
             } 
         }
 
@@ -1124,6 +1192,22 @@ int main(int argc, char **argv)
   scDistThres = node->get_parameter("sc_dist_thres").get_parameter_value().get<double>();
   node->declare_parameter("sc_max_radius", 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
   scMaximumRadius = node->get_parameter("sc_max_radius").get_parameter_value().get<double>();
+  node->declare_parameter("loop_icp_fitness_threshold", 0.15);
+  loopIcpFitnessThreshold =
+    node->get_parameter("loop_icp_fitness_threshold").get_parameter_value().get<double>();
+  node->declare_parameter("loop_max_correction_translation_m", 2.0);
+  loopMaxCorrectionTranslationM =
+    node->get_parameter("loop_max_correction_translation_m").get_parameter_value().get<double>();
+  node->declare_parameter("loop_max_correction_rotation_deg", 30.0);
+  loopMaxCorrectionRotationDeg =
+    node->get_parameter("loop_max_correction_rotation_deg").get_parameter_value().get<double>();
+
+  if (!(loopIcpFitnessThreshold > 0.0) ||
+      !std::isfinite(loopIcpFitnessThreshold)) {
+    RCLCPP_FATAL(node->get_logger(), "loop_icp_fitness_threshold must be finite and > 0");
+    rclcpp::shutdown();
+    return 2;
+  }
 
     ISAM2Params parameters;
     parameters.relinearizeThreshold = 0.01;
@@ -1158,13 +1242,17 @@ int main(int argc, char **argv)
     mapSaveSrv = node->create_service<std_srvs::srv::Trigger>("/map_save", mapSaveCallback);
 
     RCLCPP_INFO(node->get_logger(),
-        "laserPGO ready: sc_loop=%s gps_factor=%s cloud=%s odom=%s gps=%s map_file=%s",
+        "laserPGO ready: sc_loop=%s gps_factor=%s cloud=%s odom=%s gps=%s map_file=%s "
+        "loop_icp<=%.3f correction<=%.2fm/%.1fdeg dedup=on one_loop_per_keyframe=on",
         useScanContextLoopClosure ? "true" : "false",
         useGPS ? "true" : "false",
         cloudTopic.c_str(),
         odomTopic.c_str(),
         gpsTopic.c_str(),
-        mapFilePath.c_str());
+        mapFilePath.c_str(),
+        loopIcpFitnessThreshold,
+        loopMaxCorrectionTranslationM,
+        loopMaxCorrectionRotationDeg);
 
 	std::thread posegraph_slam {process_pg}; // pose graph construction
 	std::thread lc_detection {process_lcd}; // loop closure detection 
