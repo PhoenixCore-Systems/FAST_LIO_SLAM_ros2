@@ -13,6 +13,7 @@
 #include <set>
 #include <algorithm>
 #include <cmath>
+#include "stamped_queue_pair.h"
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -254,16 +255,14 @@ void saveOptimizedVerticesKITTIformat(gtsam::Values _estimates, std::string _fil
 
 void laserOdometryHandler(const nav_msgs::msg::Odometry::ConstSharedPtr _laserOdometry)
 {
-	mBuf.lock();
-	odometryBuf.push(_laserOdometry);
-	mBuf.unlock();
+    std::lock_guard<std::mutex> lock(mBuf);
+    pgo::pushBounded(odometryBuf, _laserOdometry, 50);
 } // laserOdometryHandler
 
 void laserCloudFullResHandler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr _laserCloudFullRes)
 {
-	mBuf.lock();
-	fullResBuf.push(_laserCloudFullRes);
-	mBuf.unlock();
+    std::lock_guard<std::mutex> lock(mBuf);
+    pgo::pushBounded(fullResBuf, _laserCloudFullRes, 50);
 } // laserCloudFullResHandler
 
 bool isValidGpsFix(const px4_msgs::msg::SensorGps::ConstSharedPtr& gps)
@@ -745,24 +744,24 @@ void process_pg()
 {
     while(rclcpp::ok())
     {
-		while ( !odometryBuf.empty() && !fullResBuf.empty() )
+        while (rclcpp::ok())
         {
             //
             // pop and check keyframe is or not  
             // 
-			mBuf.lock();       
-            while (!odometryBuf.empty() && toSec(odometryBuf.front()->header.stamp) < toSec(fullResBuf.front()->header.stamp))
-                odometryBuf.pop();
-            if (odometryBuf.empty())
+            mBuf.lock();
+            const auto stamp = [](const auto& msg) {
+                return rclcpp::Time(msg->header.stamp).nanoseconds();
+            };
+            if (!pgo::alignStampedQueues(odometryBuf, fullResBuf, stamp))
             {
                 mBuf.unlock();
                 break;
             }
 
-            // Time equal check
+            // Exact scan/pose pair, including when either stream loses data.
             timeLaserOdometry = toSec(odometryBuf.front()->header.stamp);
             timeLaser = toSec(fullResBuf.front()->header.stamp);
-            // TODO
 
             laserCloudFullRes->clear();
             pcl::PointCloud<PointType>::Ptr thisKeyFrame(new pcl::PointCloud<PointType>());

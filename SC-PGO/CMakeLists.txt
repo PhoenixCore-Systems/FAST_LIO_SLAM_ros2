@@ -94,6 +94,12 @@ install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch
 )
 
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(stamped_queue_pair_test test/stamped_queue_pair_test.cpp)
+  add_test(NAME stamped_queue_pair_test COMMAND stamped_queue_pair_test)
+endif()
+
 ament_package()
 
 # add_executable(kittiHelper src/kittiHelper.cpp)
